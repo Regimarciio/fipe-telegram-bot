@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:15
+    container_name: fipe_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fipe
+      POSTGRES_USER: fipe
+      POSTGRES_PASSWORD: fipe
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  bot:
+    build: .
+    container_name: fipe_bot
+    restart: unless-stopped
+    depends_on:
+      - db
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    command: python bot_completo.py
+
+  scheduler:
+    build: .
+    container_name: fipe_scheduler
+    restart: unless-stopped
+    depends_on:
+      - db
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    command: python scheduler_job.py
+
+volumes:
+  postgres_data:
