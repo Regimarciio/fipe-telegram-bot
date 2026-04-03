@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: fipe
       POSTGRES_USER: fipe
-      POSTGRES_PASSWORD: fipe
+      POSTGRES_PASSWORD: Fipe@2024Secure
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -18,23 +18,14 @@ services:
     restart: unless-stopped
     depends_on:
       - db
-    env_file:
-      - .env
+    environment:
+      TELEGRAM_TOKEN: "8414017177:AAGEd8N1ECVeewByg4ifcZwSTzUBLU-K5BE"
+      DB_HOST: db
+      DB_NAME: fipe
+      DB_USER: fipe
+      DB_PASS: Fipe@2024Secure
     volumes:
       - ./logs:/app/logs
-    command: python bot_completo.py
-
-  scheduler:
-    build: .
-    container_name: fipe_scheduler
-    restart: unless-stopped
-    depends_on:
-      - db
-    env_file:
-      - .env
-    volumes:
-      - ./logs:/app/logs
-    command: python scheduler_job.py
 
 volumes:
   postgres_data:

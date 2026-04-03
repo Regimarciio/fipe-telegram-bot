@@ -8,6 +8,7 @@ import os
 import psycopg2
 from psycopg2.extras import DictCursor
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
@@ -18,9 +19,8 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "fipe")
 DB_USER = os.getenv("DB_USER", "fipe")
-DB_PASS = os.getenv("DB_PASS", "fipe")
+DB_PASS = os.getenv("DB_PASS", "Fipe@2024Secure")
 
-# ==================== BANCO DE DADOS ====================
 def get_db_connection():
     return psycopg2.connect(
         host=DB_HOST,
@@ -30,55 +30,51 @@ def get_db_connection():
     )
 
 def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vehicles (
-            id SERIAL PRIMARY KEY,
-            telegram_user_id BIGINT NOT NULL,
-            marca VARCHAR(100) NOT NULL,
-            modelo VARCHAR(200) NOT NULL,
-            ano VARCHAR(20) NOT NULL,
-            codigo_fipe VARCHAR(50) NOT NULL,
-            valor_atual DECIMAL(10,2) NOT NULL,
-            monitorando BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS price_history (
-            id SERIAL PRIMARY KEY,
-            vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
-            valor DECIMAL(10,2) NOT NULL,
-            data_coleta TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("✅ Banco de dados inicializado")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vehicles (
+                id SERIAL PRIMARY KEY,
+                telegram_user_id BIGINT NOT NULL,
+                marca VARCHAR(100) NOT NULL,
+                modelo VARCHAR(200) NOT NULL,
+                ano VARCHAR(20) NOT NULL,
+                codigo_fipe VARCHAR(50) NOT NULL,
+                valor_atual DECIMAL(10,2) NOT NULL,
+                monitorando BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id SERIAL PRIMARY KEY,
+                vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+                valor DECIMAL(10,2) NOT NULL,
+                data_coleta TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✅ Banco de dados inicializado")
+    except Exception as e:
+        logger.warning(f"Erro ao inicializar banco: {e}")
 
 def salvar_veiculo(user_id, marca, modelo, ano, codigo_fipe, valor):
     conn = get_db_connection()
     cur = conn.cursor()
-    
     cur.execute("""
         INSERT INTO vehicles (telegram_user_id, marca, modelo, ano, codigo_fipe, valor_atual)
         VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (user_id, marca, modelo, ano, codigo_fipe, valor))
-    
     vehicle_id = cur.fetchone()[0]
-    
     cur.execute("""
         INSERT INTO price_history (vehicle_id, valor)
         VALUES (%s, %s)
     """, (vehicle_id, valor))
-    
     conn.commit()
     cur.close()
     conn.close()
@@ -87,137 +83,76 @@ def salvar_veiculo(user_id, marca, modelo, ano, codigo_fipe, valor):
 def listar_veiculos(user_id, apenas_monitorando=True):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
-    
     query = "SELECT * FROM vehicles WHERE telegram_user_id = %s"
     if apenas_monitorando:
         query += " AND monitorando = TRUE"
     query += " ORDER BY created_at DESC"
-    
     cur.execute(query, (user_id,))
     veiculos = cur.fetchall()
     cur.close()
     conn.close()
     return veiculos
 
-def parar_monitoramento(vehicle_id, user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    cur.execute("""
-        UPDATE vehicles 
-        SET monitorando = FALSE, updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s AND telegram_user_id = %s
-    """, (vehicle_id, user_id))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    return cur.rowcount > 0
-
-def get_historico(vehicle_id, user_id, limit=10):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
-    
-    cur.execute("""
-        SELECT ph.*, v.marca, v.modelo, v.ano
-        FROM price_history ph
-        JOIN vehicles v ON ph.vehicle_id = v.id
-        WHERE ph.vehicle_id = %s AND v.telegram_user_id = %s
-        ORDER BY ph.data_coleta DESC
-        LIMIT %s
-    """, (vehicle_id, user_id, limit))
-    
-    historico = cur.fetchall()
-    cur.close()
-    conn.close()
-    return historico
-
-# ==================== API FIPE (PARALLELUM - COMPLETA) ====================
 class FipeService:
-    """API pública do Parallelum - sem bloqueios - TODOS os modelos"""
-    
     BASE_URL = "https://parallelum.com.br/fipe/api/v1/motos"
     
-    def _get(self, endpoint: str) -> Optional[Any]:
-        try:
-            url = f"{self.BASE_URL}/{endpoint}"
-            logger.info(f"Chamando API: {url}")
-            resp = requests.get(url, timeout=30)  # Aumentado timeout
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Erro na API: {e}")
-            return None
+    def _get(self, endpoint: str, retry=3):
+        for tentativa in range(retry):
+            try:
+                url = f"{self.BASE_URL}/{endpoint}"
+                logger.info(f"Chamando API: {url}")
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.warning(f"Tentativa {tentativa+1} falhou: {e}")
+                if tentativa < retry - 1:
+                    time.sleep(2)
+        return None
     
     def get_marcas(self) -> List[Dict]:
-        """Get all motorcycle brands"""
         result = self._get("marcas")
         if result and isinstance(result, list):
             marcas = [{"Value": m["codigo"], "Label": m["nome"]} for m in result]
-            logger.info(f"✅ Carregadas {len(marcas)} marcas")
             return marcas
         return []
     
     def get_modelos(self, codigo_marca: int) -> List[Dict]:
-        """Get ALL models by brand code (sem limite)"""
         result = self._get(f"marcas/{codigo_marca}/modelos")
         if result and isinstance(result, dict):
             modelos = result.get("modelos", [])
-            # Converter para formato esperado - SEM FILTROS, SEM LIMITES
-            modelos_conv = [{"Value": m["codigo"], "Label": m["nome"]} for m in modelos]
-            logger.info(f"✅ Carregados TODOS os {len(modelos_conv)} modelos para marca {codigo_marca}")
-            
-            # Log dos primeiros e últimos modelos para debug
-            if modelos_conv:
-                logger.info(f"Primeiros modelos: {modelos_conv[:3]}")
-                if len(modelos_conv) > 5:
-                    logger.info(f"Últimos modelos: {modelos_conv[-3:]}")
-            
-            return modelos_conv
+            return [{"Value": m["codigo"], "Label": m["nome"]} for m in modelos]
         return []
     
     def get_anos(self, codigo_marca: int, codigo_modelo: int) -> List[Dict]:
-        """Get available years for a model"""
         result = self._get(f"marcas/{codigo_marca}/modelos/{codigo_modelo}/anos")
         if result and isinstance(result, list):
-            anos = [{"Value": a["codigo"], "Label": a["nome"]} for a in result]
-            logger.info(f"✅ Carregados {len(anos)} anos")
-            return anos
+            return [{"Value": a["codigo"], "Label": a["nome"]} for a in result]
         return []
     
     def get_valor(self, codigo_marca: int, codigo_modelo: int, ano_codigo: str) -> Optional[Dict]:
-        """Get current FIPE value"""
-        result = self._get(f"marcas/{codigo_marca}/modelos/{codigo_modelo}/anos/{ano_codigo}")
-        if result:
-            logger.info(f"✅ Valor encontrado: {result.get('Valor', 'N/A')}")
-            return result
-        return None
+        return self._get(f"marcas/{codigo_marca}/modelos/{codigo_modelo}/anos/{ano_codigo}")
     
     def parse_valor(self, response: Dict) -> Dict:
-        """Parse FIPE value response"""
         if not response:
             return {}
         try:
-            # Extrair valor numérico
             valor_str = response.get("Valor", "R$ 0").replace("R$ ", "").replace(".", "").replace(",", ".")
-            valor_float = float(valor_str)
-            
             return {
-                "valor": valor_float,
+                "valor": float(valor_str),
                 "valor_formatado": response.get("Valor", "R$ 0"),
                 "marca": response.get("Marca", ""),
                 "modelo": response.get("Modelo", ""),
                 "ano": response.get("AnoModelo", ""),
                 "codigo_fipe": response.get("CodigoFipe", ""),
-                "mes_referencia": response.get("MesReferencia", "Atual"),
-                "combustivel": response.get("Combustivel", "")
+                "mes_referencia": response.get("MesReferencia", "Atual")
             }
-        except Exception as e:
-            logger.error(f"Erro ao parsear valor: {e}")
+        except:
             return {}
 
-# ==================== MENUS ====================
 class Menus:
+    ITENS_POR_PAGINA = 20
+    
     @staticmethod
     def principal():
         keyboard = [
@@ -230,37 +165,46 @@ class Menus:
     
     @staticmethod
     def marcas(marcas: List[Dict]):
-        keyboard = []
-        for m in marcas:
-            keyboard.append([InlineKeyboardButton(m["Label"], callback_data=f"marca_{m['Value']}")])
+        keyboard = [[InlineKeyboardButton(m["Label"], callback_data=f"marca_{m['Value']}")] for m in marcas]
         keyboard.append([InlineKeyboardButton("🔙 Voltar", callback_data="voltar")])
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def modelos(modelos: List[Dict]):
-        """Mostrar TODOS os modelos - sem paginação, sem limites"""
-        keyboard = []
+    def modelos_paginado(modelos: List[Dict], pagina: int, marca_cod: int, marca_nome: str):
+        """Cria menu paginado de modelos"""
+        total = len(modelos)
+        inicio = pagina * Menus.ITENS_POR_PAGINA
+        fim = min(inicio + Menus.ITENS_POR_PAGINA, total)
         
-        # IMPORTANTE: Mostrar TODOS os modelos, sem cortar
-        for m in modelos:
+        keyboard = []
+        for m in modelos[inicio:fim]:
             nome = m["Label"]
-            # Só truncar se for muito longo (mais de 45 caracteres)
-            if len(nome) > 45:
-                nome = nome[:42] + "..."
+            if len(nome) > 35:
+                nome = nome[:32] + "..."
             keyboard.append([InlineKeyboardButton(nome, callback_data=f"modelo_{m['Value']}")])
         
-        # Adicionar botão voltar no final
+        # Botões de navegação
+        nav_buttons = []
+        if pagina > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ Anterior", callback_data=f"page_modelo_{marca_cod}_{pagina-1}"))
+        if fim < total:
+            nav_buttons.append(InlineKeyboardButton("Próximo ▶️", callback_data=f"page_modelo_{marca_cod}_{pagina+1}"))
+        
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        # Info de página
+        if total > Menus.ITENS_POR_PAGINA:
+            keyboard.append([InlineKeyboardButton(f"📄 Página {pagina+1} de {(total-1)//Menus.ITENS_POR_PAGINA + 1}", callback_data="noop")])
+        
         keyboard.append([InlineKeyboardButton("🔙 Voltar para marcas", callback_data="voltar_marcas")])
         
-        logger.info(f"📋 Criando menu com {len(keyboard)-1} modelos")
-        return InlineKeyboardMarkup(keyboard)
+        return InlineKeyboardMarkup(keyboard), inicio, fim, total
     
     @staticmethod
     def anos(anos: List[Dict]):
-        keyboard = []
-        for a in anos:
-            keyboard.append([InlineKeyboardButton(a["Label"], callback_data=f"ano_{a['Value']}")])
-        keyboard.append([InlineKeyboardButton("🔙 Voltar para modelos", callback_data="voltar_modelos")])
+        keyboard = [[InlineKeyboardButton(a["Label"], callback_data=f"ano_{a['Value']}")] for a in anos]
+        keyboard.append([InlineKeyboardButton("🔙 Voltar", callback_data="voltar_modelos")])
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
@@ -270,45 +214,14 @@ class Menus:
             [InlineKeyboardButton("❌ Cancelar", callback_data="voltar")]
         ]
         return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def lista_veiculos(veiculos):
-        keyboard = []
-        for v in veiculos:
-            texto = f"{v['marca']} {v['modelo']} {v['ano']}"
-            if len(texto) > 40:
-                texto = texto[:37] + "..."
-            keyboard.append([InlineKeyboardButton(texto, callback_data=f"veiculo_{v['id']}")])
-        keyboard.append([InlineKeyboardButton("🔙 Voltar", callback_data="voltar")])
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def acoes_veiculo(vehicle_id):
-        keyboard = [
-            [InlineKeyboardButton("📈 Ver histórico", callback_data=f"hist_{vehicle_id}")],
-            [InlineKeyboardButton("❌ Parar monitoramento", callback_data=f"stop_{vehicle_id}")],
-            [InlineKeyboardButton("🔙 Voltar", callback_data="voltar")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
 
-# ==================== HANDLERS ====================
 sessoes = {}
 fipe = FipeService()
-
-# Inicializar banco
-try:
-    init_db()
-except Exception as e:
-    logger.warning(f"Erro ao inicializar banco: {e}")
+init_db()
 
 async def start(update: Update, context):
     await update.message.reply_text(
-        "🏍 *Monitor FIPE - Motos - COMPLETO*\n\n"
-        "🔎 Consulte TODOS os modelos de TODAS as marcas\n"
-        "📊 Monitore preços automaticamente\n"
-        "📈 Acompanhe histórico de valores\n\n"
-        "✅ *Sem limites - Todos os modelos disponíveis!*\n\n"
-        "Escolha uma opção:",
+        "🏍 *Monitor FIPE - Motos*\n\nEscolha uma opção:",
         reply_markup=Menus.principal(),
         parse_mode="Markdown"
     )
@@ -318,70 +231,79 @@ async def callback(update: Update, context):
     await query.answer()
     user_id = update.effective_user.id
     data = query.data
-    
-    # ========== CONSULTAR MOTO ==========
+
+    if user_id not in sessoes:
+        sessoes[user_id] = {}
+
     if data == "consultar":
         await query.edit_message_text("⏳ Carregando marcas...")
         marcas = fipe.get_marcas()
         if marcas:
-            sessoes[user_id] = {}
-            await query.edit_message_text("🔍 *Selecione a marca da moto:*", 
-                                         reply_markup=Menus.marcas(marcas), 
-                                         parse_mode="Markdown")
-        else:
             await query.edit_message_text(
-                "❌ Erro ao carregar marcas.",
-                reply_markup=Menus.principal()
+                "🔍 *Selecione a marca:*",
+                reply_markup=Menus.marcas(marcas),
+                parse_mode="Markdown"
             )
-    
+        else:
+            await query.edit_message_text("❌ Erro ao carregar marcas.")
+
     elif data.startswith("marca_"):
         codigo = int(data.split("_")[1])
         marcas = fipe.get_marcas()
         nome = next((m["Label"] for m in marcas if m["Value"] == codigo), "")
         sessoes[user_id]["marca_cod"] = codigo
         sessoes[user_id]["marca_nome"] = nome
+        sessoes[user_id]["modelos"] = fipe.get_modelos(codigo)
+        sessoes[user_id]["pagina_modelos"] = 0
         
-        await query.edit_message_text(f"⏳ Carregando TODOS os modelos da {nome}...")
-        
-        modelos = fipe.get_modelos(codigo)
+        modelos = sessoes[user_id]["modelos"]
         if modelos:
-            msg = f"📌 *Marca:* {nome}\n\n"
-            msg += f"🔍 *Selecione o modelo:*\n"
-            msg += f"*({len(modelos)} modelos disponíveis)*\n\n"
-            msg += f"⚠️ *Lista completa - role para ver todos*"
-            
-            await query.edit_message_text(msg,
-                                         reply_markup=Menus.modelos(modelos), 
-                                         parse_mode="Markdown")
+            keyboard, inicio, fim, total = Menus.modelos_paginado(modelos, 0, codigo, nome)
+            msg = f"📌 *{nome}*\n\n🔍 *Selecione o modelo:*\n*Mostrando {inicio+1}-{fim} de {total} modelos*"
+            await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
         else:
-            await query.edit_message_text("❌ Nenhum modelo encontrado.", reply_markup=Menus.principal())
-    
+            await query.edit_message_text("❌ Nenhum modelo encontrado.")
+
+    elif data.startswith("page_modelo_"):
+        partes = data.split("_")
+        marca_cod = int(partes[2])
+        nova_pagina = int(partes[3])
+        
+        if "modelos" not in sessoes[user_id]:
+            sessoes[user_id]["modelos"] = fipe.get_modelos(marca_cod)
+        
+        modelos = sessoes[user_id]["modelos"]
+        sessoes[user_id]["pagina_modelos"] = nova_pagina
+        
+        keyboard, inicio, fim, total = Menus.modelos_paginado(modelos, nova_pagina, marca_cod, sessoes[user_id]["marca_nome"])
+        msg = f"📌 *{sessoes[user_id]['marca_nome']}*\n\n🔍 *Selecione o modelo:*\n*Mostrando {inicio+1}-{fim} de {total} modelos*"
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
     elif data.startswith("modelo_"):
         codigo = int(data.split("_")[1])
-        modelos = fipe.get_modelos(sessoes[user_id]["marca_cod"])
+        modelos = sessoes[user_id]["modelos"]
         nome = next((m["Label"] for m in modelos if m["Value"] == codigo), "")
         sessoes[user_id]["modelo_cod"] = codigo
         sessoes[user_id]["modelo_nome"] = nome
         
         await query.edit_message_text(f"⏳ Carregando anos para {nome}...")
-        
         anos = fipe.get_anos(sessoes[user_id]["marca_cod"], codigo)
+        
         if anos:
-            await query.edit_message_text(f"📌 *{sessoes[user_id]['marca_nome']} {nome}*\n\n📅 *Selecione o ano:*",
-                                         reply_markup=Menus.anos(anos), 
-                                         parse_mode="Markdown")
+            await query.edit_message_text(
+                f"📌 *{sessoes[user_id]['marca_nome']} {nome}*\n\n📅 *Selecione o ano:*",
+                reply_markup=Menus.anos(anos),
+                parse_mode="Markdown"
+            )
         else:
-            await query.edit_message_text("❌ Nenhum ano encontrado.", reply_markup=Menus.principal())
-    
+            await query.edit_message_text("❌ Nenhum ano encontrado.")
+
     elif data.startswith("ano_"):
         ano_codigo = data.split("_")[1]
-        
-        # Buscar ano label
         anos = fipe.get_anos(sessoes[user_id]["marca_cod"], sessoes[user_id]["modelo_cod"])
         ano_label = next((a["Label"] for a in anos if a["Value"] == ano_codigo), ano_codigo)
         
-        await query.edit_message_text(f"⏳ Consultando valor FIPE...")
-        
+        await query.edit_message_text("⏳ Consultando valor FIPE...")
         valor_resp = fipe.get_valor(
             sessoes[user_id]["marca_cod"],
             sessoes[user_id]["modelo_cod"],
@@ -402,8 +324,8 @@ async def callback(update: Update, context):
             )
             await query.edit_message_text(msg, reply_markup=Menus.monitor(), parse_mode="Markdown")
         else:
-            await query.edit_message_text("❌ Erro ao consultar valor.", reply_markup=Menus.principal())
-    
+            await query.edit_message_text("❌ Erro ao consultar valor.")
+
     elif data == "monitorar_sim":
         if user_id in sessoes and "ultimo_valor" in sessoes[user_id]:
             valor = sessoes[user_id]["ultimo_valor"]
@@ -416,7 +338,6 @@ async def callback(update: Update, context):
                     valor.get("codigo_fipe", ""),
                     valor.get("valor", 0)
                 )
-                
                 await query.edit_message_text(
                     f"✅ *Veículo adicionado ao monitoramento!*\n\n"
                     f"🏍 {valor.get('marca')} {valor.get('modelo')}\n"
@@ -425,126 +346,43 @@ async def callback(update: Update, context):
                     reply_markup=Menus.principal(),
                     parse_mode="Markdown"
                 )
-                if user_id in sessoes:
-                    del sessoes[user_id]
             except Exception as e:
-                logger.error(f"Erro ao salvar: {e}")
-                await query.edit_message_text("❌ Erro ao salvar no banco.", reply_markup=Menus.principal())
-    
-    # ========== MINHAS MOTOS ==========
+                await query.edit_message_text(f"❌ Erro ao salvar: {e}")
+
     elif data == "minhas":
-        try:
-            veiculos = listar_veiculos(user_id, apenas_monitorando=True)
-            if veiculos:
-                msg = "📊 *Suas motos monitoradas:*\n\n"
-                for i, v in enumerate(veiculos, 1):
-                    msg += f"{i}. *{v['marca']} {v['modelo']}*\n"
-                    msg += f"   📅 {v['ano']} | 💰 R$ {float(v['valor_atual']):,.2f}\n\n"
-                await query.edit_message_text(msg, reply_markup=Menus.principal(), parse_mode="Markdown")
-            else:
-                await query.edit_message_text(
-                    "📭 *Nenhuma moto sendo monitorada*\n\nUse '🔎 Consultar moto' para começar!",
-                    reply_markup=Menus.principal(),
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
-            logger.error(f"Erro ao listar: {e}")
-            await query.edit_message_text("❌ Erro ao carregar lista.", reply_markup=Menus.principal())
-    
-    # ========== HISTÓRICO ==========
-    elif data == "historico":
-        veiculos = listar_veiculos(user_id, apenas_monitorando=False)
+        veiculos = listar_veiculos(user_id)
         if veiculos:
-            await query.edit_message_text(
-                "📈 *Selecione a moto para ver o histórico:*",
-                reply_markup=Menus.lista_veiculos(veiculos),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                "📭 *Nenhum histórico encontrado*\n\nMonitore uma moto para começar!",
-                reply_markup=Menus.principal(),
-                parse_mode="Markdown"
-            )
-    
-    elif data.startswith("veiculo_"):
-        vehicle_id = int(data.split("_")[1])
-        await query.edit_message_text(
-            "🔧 *Opções do veículo:*",
-            reply_markup=Menus.acoes_veiculo(vehicle_id),
-            parse_mode="Markdown"
-        )
-    
-    elif data.startswith("hist_"):
-        vehicle_id = int(data.split("_")[1])
-        historico = get_historico(vehicle_id, user_id)
-        
-        if historico:
-            v = historico[0]
-            msg = f"📈 *Histórico de Preços*\n\n"
-            msg += f"🏍 {v['marca']} {v['modelo']} {v['ano']}\n\n"
-            
-            for i, h in enumerate(historico, 1):
-                data_coleta = h['data_coleta'].strftime("%b/%Y")
-                msg += f"{i}. {data_coleta}: R$ {float(h['valor']):,.2f}\n"
-            
+            msg = "📊 *Suas motos monitoradas:*\n\n"
+            for i, v in enumerate(veiculos, 1):
+                msg += f"{i}. *{v['marca']} {v['modelo']}*\n"
+                msg += f"   📅 {v['ano']} | 💰 R$ {float(v['valor_atual']):,.2f}\n\n"
             await query.edit_message_text(msg, reply_markup=Menus.principal(), parse_mode="Markdown")
         else:
-            await query.edit_message_text("❌ Nenhum histórico encontrado.", reply_markup=Menus.principal())
-    
-    elif data.startswith("stop_"):
-        vehicle_id = int(data.split("_")[1])
-        if parar_monitoramento(vehicle_id, user_id):
-            await query.edit_message_text(
-                "✅ *Monitoramento cancelado!*\n\n"
-                "A moto não será mais verificada automaticamente.\n"
-                "O histórico foi mantido.",
-                reply_markup=Menus.principal(),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text("❌ Erro ao cancelar monitoramento.", reply_markup=Menus.principal())
-    
-    # ========== REMOVER ==========
-    elif data == "remover":
-        veiculos = listar_veiculos(user_id, apenas_monitorando=True)
-        if veiculos:
-            await query.edit_message_text(
-                "❌ *Selecione a moto para parar de monitorar:*",
-                reply_markup=Menus.lista_veiculos(veiculos),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                "📭 *Nenhuma moto sendo monitorada*",
-                reply_markup=Menus.principal(),
-                parse_mode="Markdown"
-            )
-    
-    # ========== NAVEGAÇÃO ==========
+            await query.edit_message_text("📭 *Nenhuma moto monitorada*", reply_markup=Menus.principal(), parse_mode="Markdown")
+
     elif data == "voltar":
         await query.edit_message_text(
             "🏍 *Monitor FIPE - Motos*\n\nEscolha uma opção:",
             reply_markup=Menus.principal(),
             parse_mode="Markdown"
         )
-    
+
     elif data == "voltar_marcas":
         marcas = fipe.get_marcas()
-        await query.edit_message_text("🔍 *Selecione a marca:*", 
-                                     reply_markup=Menus.marcas(marcas), 
-                                     parse_mode="Markdown")
-    
-    elif data == "voltar_modelos":
-        modelos = fipe.get_modelos(sessoes[user_id]["marca_cod"])
-        msg = f"📌 *Marca:* {sessoes[user_id]['marca_nome']}\n\n"
-        msg += f"🔍 *Selecione o modelo:*\n"
-        msg += f"*({len(modelos)} modelos disponíveis)*"
-        await query.edit_message_text(msg,
-                                     reply_markup=Menus.modelos(modelos), 
-                                     parse_mode="Markdown")
+        await query.edit_message_text("🔍 *Selecione a marca:*", reply_markup=Menus.marcas(marcas), parse_mode="Markdown")
 
-# ==================== MAIN ====================
+    elif data == "voltar_modelos":
+        modelos = sessoes[user_id]["modelos"]
+        keyboard, inicio, fim, total = Menus.modelos_paginado(modelos, 0, sessoes[user_id]["marca_cod"], sessoes[user_id]["marca_nome"])
+        msg = f"📌 *{sessoes[user_id]['marca_nome']}*\n\n🔍 *Selecione o modelo:*\n*Mostrando {inicio+1}-{fim} de {total} modelos*"
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+    elif data == "noop":
+        await query.answer()
+
+    else:
+        await query.edit_message_text("Opção em desenvolvimento.", reply_markup=Menus.principal())
+
 async def main():
     if not TOKEN:
         logger.error("TOKEN não configurado!")
@@ -554,12 +392,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
     
-    logger.info("=" * 50)
-    logger.info("✅ BOT FIPE COMPLETO INICIADO!")
-    logger.info("📊 API: Parallelum - Sem limites")
-    logger.info("🏍 Todos os modelos de todas as marcas disponíveis")
-    logger.info("=" * 50)
-    
+    logger.info("✅ BOT FIPE INICIADO COM PAGINAÇÃO!")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
